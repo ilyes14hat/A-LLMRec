@@ -5,23 +5,34 @@ import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
 import numpy as np
+from torch.nn.functional import cosine_similarity
 
 from models.recsys_model import *
 from models.llm4rec import *
 from sentence_transformers import SentenceTransformer
 
 
-class two_layer_mlp(nn.Module):
-    def __init__(self, dims):
+class four_layer_mlp(nn.Module):
+    def __init__(self, input_dim, hidden_dims, dropout_rate=0.2):
         super().__init__()
-        self.fc1 = nn.Linear(dims, 128)
-        self.fc2 = nn.Linear(128, dims)
-        self.sigmoid = nn.Sigmoid()
+        self.fc1 = nn.Linear(input_dim, hidden_dims[0])
+        self.fc2 = nn.Linear(hidden_dims[0], hidden_dims[1])
+        self.fc3 = nn.Linear(hidden_dims[1], hidden_dims[2])
+        self.fc4 = nn.Linear(hidden_dims[2], hidden_dims[3])
+        self.fc5 = nn.Linear(hidden_dims[3], input_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
         
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.sigmoid(x)
-        x1 = self.fc2(x)
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = self.relu(self.fc3(x))
+        x = self.dropout(x)
+        x = self.relu(self.fc4(x))
+        x = self.dropout(x)
+        x1 = self.fc5(x)
         return x, x1
 
 class A_llmrec_model(nn.Module):
@@ -39,12 +50,12 @@ class A_llmrec_model(nn.Module):
         self.rec_sys_dim = self.recsys.hidden_units
         self.sbert_dim = 768
         
-        self.mlp = two_layer_mlp(self.rec_sys_dim)
+        self.mlp = four_layer_mlp(self.rec_sys_dim, [256, 128, 64, 32])
         if args.pretrain_stage1:
             self.sbert = SentenceTransformer('nq-distilbert-base-v1')
-            self.mlp2 = two_layer_mlp(self.sbert_dim)
+            self.mlp2 = four_layer_mlp(self.sbert_dim, [512, 256, 128, 64])
         
-        self.mse = nn.MSELoss()
+        self.infonce_loss = nn.CrossEntropyLoss()
         
         self.maxlen = args.maxlen
         self.NDCG = 0
@@ -206,14 +217,14 @@ class A_llmrec_model(nn.Module):
             neg_text_matching_text, neg_text_proj = self.mlp2(neg_text_embedding)
             
             pos_logits, neg_logits = (log_emb*pos_proj).mean(axis=1), (log_emb*neg_proj).mean(axis=1)
-            pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(neg_logits.shape, device=pos_logits.device)
+            pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(neg_logits.shape, device=neg_logits.device)
 
             loss = self.bce_criterion(pos_logits, pos_labels)
             loss += self.bce_criterion(neg_logits, neg_labels)
             
-            matching_loss = self.mse(pos_text_matching,pos_text_matching_text) + self.mse(neg_text_matching,neg_text_matching_text)
-            reconstruction_loss = self.mse(pos_proj,pos_emb) + self.mse(neg_proj,neg_emb)
-            text_reconstruction_loss = self.mse(pos_text_proj,pos_text_embedding.data) + self.mse(neg_text_proj,neg_text_embedding.data)
+            matching_loss = self.infonce_loss(pos_text_matching, pos_text_matching_text) + self.infonce_loss(neg_text_matching, neg_text_matching_text)
+            reconstruction_loss = self.infonce_loss(pos_proj, pos_emb) + self.infonce_loss(neg_proj, neg_emb)
+            text_reconstruction_loss = self.infonce_loss(pos_text_proj, pos_text_embedding.data) + self.infonce_loss(neg_text_proj, neg_text_embedding.data)
             
             total_loss = loss + matching_loss + 0.5*reconstruction_loss + 0.2*text_reconstruction_loss
             total_loss.backward()
@@ -246,7 +257,9 @@ class A_llmrec_model(nn.Module):
         while len(neg_item_id)<50:
             t = np.random.randint(1, self.item_num+1)
             if not (t in interact_ids or t in neg_item_id):
-                neg_item_id.append(t)
+                candidate_emb = self.recsys.model.item_emb(torch.LongTensor([t]).to(self.device))
+                if cosine_similarity(candidate_emb, self.recsys.model.item_emb(torch.LongTensor([target_item_id]).to(self.device))) < 0.5:
+                    neg_item_id.append(t)
         random.shuffle(neg_item_id)
         
         candidate_ids = [target_item_id]
